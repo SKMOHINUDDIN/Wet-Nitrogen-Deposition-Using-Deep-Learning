@@ -1,5 +1,5 @@
 # Wet-Nitrogen-Deposition-Using-Deep-Learning
-A reproducible Python pipeline to estimate wet nitrogen deposition using a single deep-learning model. The code ingests gridded emissions and meteorological drivers, aligns them with observation networks, trains a neural network, and produces annual global maps (e.g., 1990–2019) with evaluation against independent stations.
+A reproducible Python pipeline to estimate wet nitrogen deposition using a single deep-learning model. The code ingests gridded emissions and meteorological drivers, aligns them with observation networks, trains a deep learning network, and produces annual global maps (e.g., 1990–2019) with evaluation against independent stations.
 
 Highlights
 
