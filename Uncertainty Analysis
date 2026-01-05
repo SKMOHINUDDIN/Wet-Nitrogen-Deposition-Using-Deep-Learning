@@ -1,0 +1,307 @@
+import os
+import numpy as np
+import pandas as pd
+import rasterio
+from rasterio.warp import reproject, Resampling
+
+# ============================================================
+# YOUR PATHS (AS YOU PROVIDED)
+# ============================================================
+USA_DIR = r"D:\Sekh Mohinuddin\PhD Work\NOx_NH3_Conference\1st Objectives\Global N deposition\USA\Deposition\WetDIN_Total_asN"
+USA_PATTERN = os.path.join(USA_DIR, "WetDIN_{year}_asN.tif")  # 1990..2019
+
+EU_DIR_A = r"D:\Sekh Mohinuddin\PhD Work\NOx_NH3_Conference\1st Objectives\Global N deposition\Europe"
+EU_PATTERN_A = os.path.join(EU_DIR_A, "WDEP_Total_{year}_flipped.tif")   # 1990..2004
+EU_DIR_B = r"D:\Sekh Mohinuddin\PhD Work\NOx_NH3_Conference\1st Objectives\Global N deposition\Europe\Wet N"
+EU_PATTERN_B = os.path.join(EU_DIR_B, "EMEP_WDEP_{year}.tif")            # 2005..2019
+
+CN_DIR_BLOCKS = r"D:\Sekh Mohinuddin\PhD Work\NOx_NH3_Conference\1st Objectives\Global N deposition\Inorganic Nitrogen deposition  database1.0\NITROGEN1_1996-2015\1996-2015"
+CN_MEAN_96_00 = os.path.join(CN_DIR_BLOCKS, "DIN_1996_2000.tif")  # 5-year mean
+CN_MEAN_01_05 = os.path.join(CN_DIR_BLOCKS, "DIN_2001_2005.tif")  # 5-year mean
+CN_MEAN_06_10 = os.path.join(CN_DIR_BLOCKS, "DIN_2006_2010.tif")  # 5-year mean
+
+CN_DIR_2011_2019 = r"D:\Sekh Mohinuddin\PhD Work\NOx_NH3_Conference\1st Objectives\Global N deposition\Inorganic Nitrogen deposition  database1.0\Inorganic Nitrogen deposition  database1.0\Data File\Wet N"
+CN_PERYEAR_PATTERN = os.path.join(CN_DIR_2011_2019, "{year}.tif")        # 2011..2019
+
+PRED_PATTERN = r"D:\Sekh Mohinuddin\PhD Work\NOx_NH3_Conference\2nd Objectives\Depositar\Global_0p1_Pred_DL\Global_DL_{year}_0p1deg.tif"
+
+OUT_CSV = r"D:\Sekh Mohinuddin\PhD Work\NOx_NH3_Conference\2nd Objectives\Depositar\Global_0p1_Pred_DL\uncertainty_obs_unobs_global_1990_2019_FROM_TIFF.csv"
+
+# ============================================================
+# SETTINGS
+# ============================================================
+START_YEAR = 1990
+END_YEAR   = 2019
+
+BOOT_N = 300          # bootstrap replicates (increase to 1000 for final paper)
+SEED   = 123
+NODATA_SENTINELS = [-1.0e37, -3.4e38, 3.4e38]  # common junk fill values
+
+# ============================================================
+# HELPERS
+# ============================================================
+def pick_eu_obs_path(year: int) -> str | None:
+    if 1990 <= year <= 2004:
+        p = EU_PATTERN_A.format(year=year)
+        return p if os.path.exists(p) else None
+    if 2005 <= year <= 2019:
+        p = EU_PATTERN_B.format(year=year)
+        return p if os.path.exists(p) else None
+    return None
+
+def pick_cn_obs_path(year: int) -> str | None:
+    # CN only from 1996 in your dataset
+    if 1996 <= year <= 2000:
+        return CN_MEAN_96_00 if os.path.exists(CN_MEAN_96_00) else None
+    if 2001 <= year <= 2005:
+        return CN_MEAN_01_05 if os.path.exists(CN_MEAN_01_05) else None
+    if 2006 <= year <= 2010:
+        return CN_MEAN_06_10 if os.path.exists(CN_MEAN_06_10) else None
+    if 2011 <= year <= 2019:
+        p = CN_PERYEAR_PATTERN.format(year=year)
+        return p if os.path.exists(p) else None
+    return None
+
+def clean_array(a, nodata=None):
+    a = a.astype("float64", copy=False)
+    if nodata is not None and np.isfinite(nodata):
+        a = np.where(a == nodata, np.nan, a)
+    # remove sentinel junk
+    for s in NODATA_SENTINELS:
+        a = np.where(a == s, np.nan, a)
+    # remove insane magnitudes
+    a = np.where(np.abs(a) > 1e30, np.nan, a)
+    return a
+
+def read_pred_year(year: int):
+    pred_path = PRED_PATTERN.format(year=year)
+    if not os.path.exists(pred_path):
+        raise FileNotFoundError(f"Missing pred raster: {pred_path}")
+    with rasterio.open(pred_path) as src:
+        arr = src.read(1, masked=False)
+        arr = clean_array(arr, src.nodata)
+        profile = src.profile
+        transform = src.transform
+        crs = src.crs
+    return pred_path, arr, profile, transform, crs
+
+def reproject_to_match(src_path: str, match_profile: dict):
+    """Reproject src raster to match_profile grid. Returns array on match grid."""
+    with rasterio.open(src_path) as src:
+        src_arr = src.read(1, masked=False)
+        src_arr = clean_array(src_arr, src.nodata)
+
+        dst = np.full((match_profile["height"], match_profile["width"]), np.nan, dtype="float64")
+
+        reproject(
+            source=src_arr,
+            destination=dst,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            dst_transform=match_profile["transform"],
+            dst_crs=match_profile["crs"],
+            resampling=Resampling.nearest,  # mask-building, nearest is correct
+            src_nodata=np.nan,
+            dst_nodata=np.nan,
+        )
+    return dst
+
+def pixel_area_ha_from_geographic(transform, height, width):
+    """
+    Approx area (ha) for geographic lat/lon grid cells using spherical formula:
+    area = R^2 * dlon * (sin(lat2)-sin(lat1))
+    """
+    R = 6378137.0  # meters
+    dlon = transform.a  # degrees per pixel in x (assumes north-up)
+    dlat = -transform.e # degrees per pixel in y (positive)
+    if dlon == 0 or dlat == 0:
+        raise ValueError("Invalid transform for area calculation.")
+    dlon_rad = np.deg2rad(abs(dlon))
+
+    # y -> latitude of pixel edges
+    # top edge lat of row 0 is: transform.f
+    lat_top = transform.f
+    # lat edge array length height+1
+    lat_edges = lat_top - np.arange(0, height + 1) * dlat
+    lat1 = np.deg2rad(lat_edges[:-1])
+    lat2 = np.deg2rad(lat_edges[1:])
+    row_area_m2 = (R * R) * dlon_rad * (np.sin(lat1) - np.sin(lat2))  # positive in N hemisphere
+    row_area_m2 = np.abs(row_area_m2)
+    row_area_ha = row_area_m2 / 10000.0
+    area_ha = np.repeat(row_area_ha[:, None], width, axis=1)
+    return area_ha
+
+def to_Tg_from_kg_per_ha(values_kg_ha, area_ha):
+    # kg/ha * ha = kg; 1 Tg = 1e9 kg
+    return (values_kg_ha * area_ha) / 1e9
+
+def bootstrap_total(contrib_Tg, B=300, seed=123):
+    """
+    contrib_Tg: 1D array of per-pixel Tg contributions (finite)
+    returns (mean_total, ci2p5, ci97p5)
+    """
+    x = contrib_Tg[np.isfinite(contrib_Tg)]
+    if x.size == 0:
+        return np.nan, np.nan, np.nan
+
+    mean_total = float(np.sum(x))
+
+    rng = np.random.default_rng(seed)
+    n = x.size
+    # bootstrap sums
+    sums = np.empty(B, dtype="float64")
+    for b in range(B):
+        idx = rng.integers(0, n, size=n)
+        sums[b] = np.sum(x[idx])
+    ci2p5, ci97p5 = np.percentile(sums, [2.5, 97.5])
+    return mean_total, float(ci2p5), float(ci97p5)
+
+def uncertainty_pct(mean_total, ci2p5, ci97p5):
+    """
+    Uncertainty as half-CI width relative to mean (%):
+      100 * (ci97 - ci2) / (2*mean)
+    """
+    if not np.isfinite(mean_total) or mean_total == 0 or not np.isfinite(ci2p5) or not np.isfinite(ci97p5):
+        return np.nan
+    return 100.0 * (ci97p5 - ci2p5) / (2.0 * abs(mean_total))
+
+def MAD(x):
+    x = x[np.isfinite(x)]
+    if x.size == 0:
+        return np.nan
+    med = np.median(x)
+    return float(np.median(np.abs(x - med)))
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
+def main():
+    rows = []
+    rng_seed_base = SEED
+
+    for year in range(START_YEAR, END_YEAR + 1):
+        print(f"\n=== YEAR {year} ===")
+
+        # --- load prediction raster for the year (global 0.1deg)
+        pred_path, pred, prof, transform, crs = read_pred_year(year)
+        match_profile = {
+            "crs": crs,
+            "transform": transform,
+            "height": prof["height"],
+            "width": prof["width"],
+        }
+
+        # --- pixel area (ha), assuming the pred is lat/lon (typical for 0.1deg)
+        # If your pred is projected, this part must change.
+        if crs is None or not crs.is_geographic:
+            raise ValueError(
+                f"Pred raster CRS is not geographic lat/lon. "
+                f"Update area calculation for projected CRS. Pred file: {pred_path}"
+            )
+        area_ha = pixel_area_ha_from_geographic(transform, prof["height"], prof["width"])
+
+        # --- build obs mask from USA + EU + CN observation rasters
+        obs_mask = np.zeros(pred.shape, dtype=bool)
+
+        # USA obs
+        usa_obs_path = USA_PATTERN.format(year=year)
+        if os.path.exists(usa_obs_path):
+            usa_obs = reproject_to_match(usa_obs_path, match_profile)
+            obs_mask |= np.isfinite(usa_obs)
+        else:
+            print(f"[WARN] Missing USA obs: {usa_obs_path}")
+
+        # EU obs
+        eu_obs_path = pick_eu_obs_path(year)
+        if eu_obs_path is not None:
+            eu_obs = reproject_to_match(eu_obs_path, match_profile)
+            obs_mask |= np.isfinite(eu_obs)
+        else:
+            print(f"[WARN] Missing EU obs for year {year}")
+
+        # CN obs
+        cn_obs_path = pick_cn_obs_path(year)
+        if cn_obs_path is not None:
+            cn_obs = reproject_to_match(cn_obs_path, match_profile)
+            obs_mask |= np.isfinite(cn_obs)
+        else:
+            print(f"[INFO] No CN obs for year {year} (expected before 1996)")
+
+        # global valid mask from pred
+        pred_valid = np.isfinite(pred)
+
+        obs_pix = obs_mask & pred_valid
+        unobs_pix = (~obs_mask) & pred_valid
+
+        n_obs = int(np.sum(obs_pix))
+        n_unobs = int(np.sum(unobs_pix))
+        print(f"[PIXELS] obs={n_obs} | unobs={n_unobs}")
+
+        # --- totals (using PRED values split by obs/unobs)
+        pred_Tg_contrib = to_Tg_from_kg_per_ha(pred, area_ha)
+
+        obs_contrib = pred_Tg_contrib[obs_pix]
+        unobs_contrib = pred_Tg_contrib[unobs_pix]
+        global_contrib = pred_Tg_contrib[pred_valid]
+
+        # bootstrap CI (separate bootstraps)
+        obs_mean, obs_lo, obs_hi = bootstrap_total(obs_contrib, B=BOOT_N, seed=rng_seed_base + year*3 + 0)
+        un_mean, un_lo, un_hi = bootstrap_total(unobs_contrib, B=BOOT_N, seed=rng_seed_base + year*3 + 1)
+        gl_mean, gl_lo, gl_hi = bootstrap_total(global_contrib, B=BOOT_N, seed=rng_seed_base + year*3 + 2)
+
+        obs_u = uncertainty_pct(obs_mean, obs_lo, obs_hi)
+        un_u  = uncertainty_pct(un_mean,  un_lo,  un_hi)
+        gl_u  = uncertainty_pct(gl_mean,  gl_lo,  gl_hi)
+
+        # --- sigma_global_MAD_(obs-pred)_units on obs pixels
+        # Use whichever obs rasters exist; stack them (USA/EU/CN) and compute residual where any obs exists
+        # If multiple obs overlap, last one wins; practically they don't overlap much.
+        obs_values = np.full(pred.shape, np.nan, dtype="float64")
+
+        if os.path.exists(usa_obs_path):
+            obs_values = np.where(np.isfinite(usa_obs), usa_obs, obs_values)
+        if eu_obs_path is not None:
+            obs_values = np.where(np.isfinite(eu_obs), eu_obs, obs_values)
+        if cn_obs_path is not None:
+            obs_values = np.where(np.isfinite(cn_obs), cn_obs, obs_values)
+
+        resid = obs_values - pred
+        sigma_mad = MAD(resid[obs_pix])  # in kg/ha (or whatever your raster units are)
+
+        rows.append({
+            "year": year,
+
+            "global_total_Tg": gl_mean,
+            "obs_area_total_Tg": obs_mean,
+            "unobs_area_total_Tg": un_mean,
+
+            "obs_CI2p5_Tg": obs_lo,
+            "obs_CI97p5_Tg": obs_hi,
+            "obs_uncertainty_pct": obs_u,
+
+            "unobs_CI2p5_Tg": un_lo,
+            "unobs_CI97p5_Tg": un_hi,
+            "unobs_uncertainty_pct": un_u,
+
+            "global_CI2p5_Tg": gl_lo,
+            "global_CI97p5_Tg": gl_hi,
+            "global_uncertainty_pct": gl_u,
+
+            "sigma_global_MAD_(obs-pred)_units": sigma_mad,
+            "n_obs_pixels": n_obs,
+            "n_unobs_pixels": n_unobs,
+        })
+
+    out = pd.DataFrame(rows)
+
+    # nicer formatting
+    num_cols = [c for c in out.columns if c != "year"]
+    out[num_cols] = out[num_cols].astype("float64")
+
+    out.to_csv(OUT_CSV, index=False)
+    print("\n[DONE] Wrote:", OUT_CSV)
+    print("\nPreview:")
+    print(out.head(10).to_string(index=False))
+
+if __name__ == "__main__":
+    main()
